@@ -29,6 +29,12 @@ class RunCommand extends Command
     {
         $this->loadConfig($input);
 
+        $ftpDisabled = $this->config['fritzbox']['ftp']['disabled'] ?? false;
+        if ($ftpDisabled) {
+            $input->setOption('image', false);
+            error_log('Images can only be uploaded if ftp is enabled!');
+        }
+
         // we want to check for image upload show stoppers as early as possible
         if ($input->getOption('image')) {
             $this->checkUploadImagePreconditions($this->config['fritzbox'], $this->config['phonebook']);
@@ -70,25 +76,31 @@ class RunCommand extends Command
             }
         }
 
-        // fritzbox format
-        $xmlPhonebook = exportPhonebook($vcards, $this->config);
-        error_log(sprintf(PHP_EOL."Converted %d vCard(s)", count($vcards)));
+        // convert fritzbox format
+        error_log("Converting vCard(s)");
+        $contacts = convertVCards($vcards, $this->config);
+        error_log(sprintf("Converted %d vCard(s) into %d contacts", count($vcards), count($contacts)));
 
-        if (!count($vcards)) {
-            error_log("Phonebook empty - skipping upload");
+        if (!count($contacts)) {
+            error_log("Phonebook empty - skipping write to file");
             return 1;
         }
+
+        // fritzbox phonebook
+        $xmlPhonebook = contactsToFritzXML($contacts, $this->config);
 
         // write back saved attributes
         $xmlPhonebook = mergeAttributes($xmlPhonebook, $savedAttributes);
 
         // upload
         error_log("Uploading new phonebook to FRITZ!Box");
-        uploadPhonebook($xmlPhonebook, $this->config);
+        uploadPhonebook($xmlPhonebook, $this->config['fritzbox'], $this->config['phonebook']);
         error_log("Successful uploaded new FRITZ!Box phonebook");
 
         // uploading background image
-        if (count($this->config['fritzbox']['fritzfons']) && $this->config['phonebook']['id'] == 0) {
+        if (count($this->config['fritzbox']['fritzfons']) &&
+            $this->config['phonebook']['id'] == 0 &&
+            !$ftpDisabled) {
             uploadBackgroundImage($savedAttributes, $this->config['fritzbox']);
         }
 

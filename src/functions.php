@@ -23,8 +23,9 @@ define("MAX_IMAGE_COUNT", 150);
 function backendProvider(array $config): Backend
 {
     $options = $config['server'] ?? $config;
+    $method = $options['method'] ?? 'REPORT';
 
-    $backend = new Backend($options['url']);
+    $backend = new Backend($options['url'], $method);
     $backend->setAuth($options['user'], $options['password']);
     $backend->mergeClientOptions($options['http'] ?? []);
 
@@ -66,7 +67,7 @@ function getFtpConnection($url, $user, $password, $directory, $secure)
     $connectFunc = $secure ? 'ftp_connect' : 'ftp_ssl_connect';
 
     if ($connectFunc == 'ftp_ssl_connect' && !function_exists('ftp_ssl_connect')) {
-        throw new \Exception("PHP lacks support for 'ftp_ssl_connect', please use `plainFTP` to switch to unencrypted FTP");
+        throw new \Exception("PHP lacks support for 'ftp_ssl_connect', please use `ftp` => `plain` to switch to unencrypted FTP");
     }
     if (false === ($ftp_conn = $connectFunc($ftpserver))) {
         $message = sprintf("Could not connect to ftp server %s for upload", $ftpserver);
@@ -163,6 +164,7 @@ function getJPEGimage($vcard)
             }
         } else {                                            // according to RFC 2426 this should be the usual case
             $mimeType = strtoupper($vcard->PHOTO['TYPE']);
+            $mimeType = str_replace("IMAGE/", '', $mimeType);
             $imageData = (string)$vcard->PHOTO;
         }
     } elseif ((string)$vcard->VERSION == '4.0') {
@@ -219,7 +221,7 @@ function uploadImages(array $vcards, array $config, array $phonebook, callable $
     $imgPath = rtrim($imgPath, '/') . '/';  // ensure one slash at end
 
     // Prepare FTP connection
-    $secure = @$config['plainFTP'] ? $config['plainFTP'] : false;
+    $secure = $config['ftp']['plain'] ?? false;
     $ftp_conn = getFtpConnection($config['url'], $config['user'], $config['password'], $config['fonpix'], $secure);
 
     // Build up dictionary to look up UID => current FTP image file
@@ -426,13 +428,31 @@ function filtersMatch(Document $vcard, array $filters): bool
 }
 
 /**
- * Export cards to fritzbox xml
+ * convert vCards into contacts of FRITZ!box xml format
  *
  * @param Document[] $cards
  * @param array $conversions
- * @return SimpleXMLElement     the XML phone book in Fritz Box format
+ * @return SimpleXMLElement[] fritzbox XML contact format
  */
-function exportPhonebook(array $cards, array $conversions): SimpleXMLElement
+function convertVCards(array $cards, array $conversions): array
+{
+    $converter = new Converter($conversions);
+    $contacts = [];
+
+    foreach ($cards as $card) {
+        $contacts = array_merge($contacts, $converter->convert($card));
+    }
+    return $contacts;
+}
+
+/**
+ * get contacts in fritzbox xml format
+ *
+ * @param SimpleXMLElement[] $contacts
+ * @param array $conversions
+ * @return SimpleXMLElement $xmlPhonebook
+ */
+function contactsToFritzXML(array $contacts, array $conversions): SimpleXMLElement
 {
     $xmlPhonebook = new SimpleXMLElement(
         <<<EOT
@@ -446,36 +466,44 @@ EOT
     $root = $xmlPhonebook->xpath('//phonebook')[0];
     $root->addAttribute('name', $conversions['phonebook']['name']);
 
-    $converter = new Converter($conversions);
     $restore = new Restorer;
 
-    foreach ($cards as $card) {
-        $contacts = $converter->convert($card);
-        foreach ($contacts as $contact) {
-            $restore->xml_adopt($root, $contact);
-        }
+    foreach ($contacts as $contact) {
+        $restore->xml_adopt($root, $contact);
     }
     return $xmlPhonebook;
 }
 
 /**
- * Upload cards to fritzbox
+ * get secure access to FRITZ!Box router
  *
- * @param SimpleXMLElement  $xmlPhonebook
- * @param array             $config
- * @return void
+ * @param array $fritzConfig
+ * @return Api $fritz
  */
-function uploadPhonebook(SimpleXMLElement $xmlPhonebook, array $config)
+function getFritzBoxAccess(array $fritzConfig)
 {
-    $options = $config['fritzbox'];
-
-    $fritz = new Api($options['url']);
-    $fritz->setAuth($options['user'], $options['password']);
-    $fritz->mergeClientOptions($options['http'] ?? []);
+    $fritz = new Api($fritzConfig['url']);
+    $fritz->setAuth($fritzConfig['user'], $fritzConfig['password']);
+    $fritz->mergeClientOptions($fritzConfig['http'] ?? []);
     $fritz->login();
 
+    return $fritz;
+}
+
+/**
+ * Upload cards to fritzbox
+ *
+ * @param SimpleXMLElement $xmlPhonebook
+ * @param array $fritzConfig
+ * @param array $phonebookConfig
+ * @return void
+ */
+function uploadPhonebook(SimpleXMLElement $xmlPhonebook, array $fritzConfig, array $phonebookConfig)
+{
+    $fritz = getFritzBoxAccess($fritzConfig);
+
     $formfields = [
-        'PhonebookId' => $config['phonebook']['id']
+        'PhonebookId' => $phonebookConfig['id']
     ];
 
     $filefields = [
@@ -509,25 +537,22 @@ function uploadSuccessful(string $msg): bool
 /**
  * Downloads the phone book from Fritzbox
  *
- * @param   array $fritzbox
- * @param   array $phonebook
+ * @param array $fritzConfig
+ * @param array $phonebookConfig
  * @return  SimpleXMLElement|bool with the old existing phonebook
  */
-function downloadPhonebook(array $fritzbox, array $phonebook)
+function downloadPhonebook(array $fritzConfig, array $phonebookConfig)
 {
-    $fritz = new Api($fritzbox['url']);
-    $fritz->setAuth($fritzbox['user'], $fritzbox['password']);
-    $fritz->mergeClientOptions($fritzbox['http'] ?? []);
-    $fritz->login();
+    $fritz = getFritzBoxAccess($fritzConfig);
 
     $formfields = [
-        'PhonebookId' => $phonebook['id'],
-        'PhonebookExportName' => $phonebook['name'],
+        'PhonebookId' => $phonebookConfig['id'],
+        'PhonebookExportName' => $phonebookConfig['name'],
         'PhonebookExport' => "",
     ];
     $result = $fritz->postFile($formfields, []); // send the command to load existing phone book
     if (substr($result, 0, 5) !== "<?xml") {
-        error_log("ERROR: Could not load phonebook with ID=".$phonebook['id']);
+        error_log("ERROR: Could not load phonebook with ID=".$phonebookConfig['id']);
         return false;
     }
     $xmlPhonebook = simplexml_load_string($result);
@@ -598,15 +623,18 @@ function uploadBackgroundImage($attributes, array $config)
  */
 function uploadAttributes($phonebook, $config)
 {
+    $fritzbox = $config['fritzbox'];
     $restore = new Restorer;
-    if (!count($specialAttributes = $restore->getPhonebookData($phonebook, $config))) {
+    $ftpDisabled = $fritzbox['ftp']['disabled'] ?? false;
+    if ($ftpDisabled ||
+        !count($specialAttributes = $restore->getPhonebookData($phonebook, $config))) {
+        error_log('No special attributes are saved!');
         return [];
     }
-    $fritzbox= $config['fritzbox'];
 
     error_log('Save internal data from recent FRITZ!Box phonebook!');
     // Prepare FTP connection
-    $secure = @$fritzbox['plainFTP'] ? $fritzbox['plainFTP'] : false;
+    $secure = $fritzbox['ftp']['plain'] ?? false;
     $ftp_conn = getFtpConnection($fritzbox['url'], $fritzbox['user'], $fritzbox['password'], '/FRITZ/mediabox', $secure);
     // backup already stored data
     if (ftp_size($ftp_conn, 'Attributes.csv') != -1) {                  // file already exists
@@ -638,8 +666,14 @@ function uploadAttributes($phonebook, $config)
  */
 function downloadAttributes($config)
 {
+    $ftpDisabled = $config['ftp']['disabled'] ?? false;
+    if ($ftpDisabled) {
+        error_log('Ftp is not available or disabled. Special attributes cannot be loaded!');
+        return [];
+    }
+
     // Prepare FTP connection
-    $secure = @$config['plainFTP'] ? $config['plainFTP'] : false;
+    $secure = $config['ftp']['plain'] ?? false;
     $ftp_conn = getFtpConnection($config['url'], $config['user'], $config['password'], '/FRITZ/mediabox', $secure);
     if (ftp_size($ftp_conn, 'Attributes.csv') == -1) {
         return [];

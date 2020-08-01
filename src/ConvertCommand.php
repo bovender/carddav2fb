@@ -32,6 +32,12 @@ class ConvertCommand extends Command
 
         $filename = $input->getArgument('source');
 
+        $ftpDisabled = $this->config['fritzbox']['ftp']['disabled'] ?? false;
+        if ($ftpDisabled) {
+            $input->setOption('image', false);
+            error_log('Images can only be uploaded if ftp is enabled!');
+        }
+
         // we want to check for image upload show stoppers as early as possible
         if ($input->getOption('image')) {
             $this->checkUploadImagePreconditions($this->config['fritzbox'], $this->config['phonebook']);
@@ -58,14 +64,19 @@ class ConvertCommand extends Command
             }
         }
 
-        // fritzbox format
-        $xmlPhonebook = exportPhonebook($vcards, $this->config);
-        error_log(sprintf(PHP_EOL."Converted %d vCard(s)", count($vcards)));
 
-        if (!count($vcards)) {
+        // convert fritzbox format
+        error_log("Converting vCard(s)");
+        $contacts = convertVCards($vcards, $this->config);
+        error_log(sprintf("Converted %d vCard(s) into %d contacts", count($vcards), count($contacts)));
+
+        if (!count($contacts)) {
             error_log("Phonebook empty - skipping write to file");
             return 1;
         }
+
+        // fritzbox phonebook
+        $xmlPhonebook = contactsToFritzXML($contacts, $this->config);
 
         $filename = $input->getArgument('destination');
         if ($xmlPhonebook->asXML($filename)) {
